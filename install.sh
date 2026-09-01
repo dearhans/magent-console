@@ -12,14 +12,14 @@
 #   ./install.sh --yes                   # 非交互，全部用默认值
 #
 # 远程一键装（把 REPO_URL 换成你自己的仓库）：
-#   curl -fsSL https://raw.githubusercontent.com/<你>/magent-console/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/dearhans/magent-console/master/install.sh | bash
 #
 # 支持：macOS / Debian-Ubuntu / Fedora-RHEL / Arch / Alpine / openSUSE / WSL2
 # 幂等：已装好的组件会跳过，可重复运行。
 # ==========================================================================
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/your-name/magent-console.git}"
+REPO_URL="${REPO_URL:-https://github.com/dearhans/magent-console.git}"
 INSTALL_DIR="${INSTALL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PORT="${PORT:-8899}"
 

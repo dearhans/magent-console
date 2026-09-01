@@ -84,10 +84,10 @@ python3 server.py --port 8899 --open
 幂等可重复运行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你>/magent-console/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dearhans/magent-console/master/install.sh | bash
 ```
 
-远程一键装时把脚本顶部的 `REPO_URL` 换成你自己的仓库地址。
+脚本已默认指向本项目仓库（`dearhans/magent-console`，master 分支）。想装自己 fork 的版本，先 `export REPO_URL=https://github.com/<你的账号>/magent-console.git` 再执行上面那条命令。
 
 ---
 

@@ -83,7 +83,7 @@ Running **local models** (Ollama) switches to a different model: how many 4B-Q4 
 `install.sh` covers macOS / Debian-Ubuntu / Fedora-RHEL / Arch / Alpine / openSUSE / WSL2, and is idempotent:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<you>/magent-console/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dearhans/magent-console/master/install.sh | bash
 ```
 
 Replace `REPO_URL` at the top of the script with your own repo.
