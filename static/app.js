@@ -13,17 +13,20 @@
   // 各等级对应的环填充比例（避免分数绝对值导致环形几乎不可见）
   const GRADE_PCT = { S: 0.95, A: 0.78, B: 0.55, C: 0.32 };
 
-  // 异质分工的角色模板
-  const ROLE_TEMPLATES = [
-    { name: '实现', text: '实现 <功能>：\n- 按现有代码风格，不引入新依赖\n- 附带最小可运行示例\n- 完成后自测并报告改动文件' },
-    { name: '测试', text: '为 <功能> 编写测试：\n- 覆盖正常路径 + 边界 + 异常\n- 不修改被测源码\n- 报告覆盖率与失败用例' },
-    { name: 'Review', text: '审查本次改动：\n- 指出 bug / 安全隐患 / 性能问题\n- 按严重程度排序\n- 不直接改代码，只给清单' },
-    { name: '文档', text: '为 <功能> 补充文档：\n- 用法示例 + 参数说明\n- 与现有 README 风格一致\n- 只改文档，不改代码' },
-    { name: '重构', text: '重构 <模块>：\n- 保持外部接口不变\n- 消除重复逻辑\n- 每步提交可独立回滚' },
-    { name: '优化', text: '分析 <模块> 性能瓶颈：\n- 先测量再优化，给出前后数据\n- 只做有数据支撑的改动\n- 报告收益与风险' },
-    { name: '检索', text: '调研 <主题>：\n- 给出结论 + 来源链接\n- 标注结论的确定性\n- 不写代码，只出调研报告' },
-    { name: '验证', text: '验证实现是否满足 requirement：\n- 逐条比对验收标准\n- 列出不符合项\n- 给出最小修复建议' },
+  // 异质分工的角色库：由后端 config/roles.json 提供（可在「设置 → 角色库」里增删改）
+  // 启动前若还没拉到，用下面的最小兜底，避免界面空白
+  let ROLES = [
+    { name: '实现', text: '实现 <功能>：\n- 按现有代码风格，不引入新依赖' },
+    { name: '测试', text: '为 <功能> 编写测试：\n- 覆盖正常路径 + 边界 + 异常' },
+    { name: 'Review', text: '审查本次改动：\n- 指出 bug / 安全隐患 / 性能问题' },
+    { name: '文档', text: '为 <功能> 补充文档：\n- 用法示例 + 参数说明' },
   ];
+
+  // 异质分工下第 i 个 pane 的默认角色名（按角色库循环取）
+  function roleDefaultName(i) {
+    if (ROLES && ROLES.length) return ROLES[i % ROLES.length].name;
+    return 'Agent ' + (i + 1);
+  }
 
   const PARALLEL_TPL =
     '任务：<一句话描述>\n\n背景：\n- <相关上下文>\n\n要求：\n- <约束 1>\n- <约束 2>\n\n验收标准：\n- <可客观判定的标准>\n\n输出：改动文件清单 + 关键决策说明。不要修改与本任务无关的文件。';
@@ -169,14 +172,18 @@
       $('mGpuSub').textContent = '本地模型只能 CPU 推理';
     }
 
-    // 磁盘
+    // 磁盘（显示项目实际所在磁盘，并标明是哪块盘）
     const freeGb = disk.free_gb || 0;
     $('mDisk').textContent = freeGb.toFixed(1) + ' GB';
     const diskPct = disk.total_gb ? Math.round(((disk.total_gb - freeGb) / disk.total_gb) * 100) : 0;
     const diskBar = $('mDiskBar');
     diskBar.style.width = diskPct + '%';
     diskBar.className = 'bar__fill' + (freeGb < 5 ? ' bar__fill--danger' : diskPct > 90 ? ' bar__fill--warn' : '');
-    $('mDiskSub').textContent = disk.total_gb ? '共 ' + disk.total_gb.toFixed(0) + ' GB · 已用 ' + diskPct + '%' : '';
+    const diskLabel = disk.drive || disk.mount_point || '';
+    $('mDiskSub').textContent = disk.total_gb
+      ? (diskLabel ? diskLabel + ' · ' : '') + '共 ' + disk.total_gb.toFixed(0) + ' GB · 已用 ' + diskPct + '%'
+      : (diskLabel || '');
+    $('mDiskSub').title = disk.path ? ('检测路径：' + disk.path + (disk.device ? '（设备 ' + disk.device + '）' : '')) : '';
 
     // 理由
     const ul = $('reasonList');
@@ -205,6 +212,19 @@
       renderAgents();
     } catch (e) {
       toast('获取 agent 列表失败：' + e.message, 'err');
+    }
+  }
+
+  // ============================================================ 角色库
+  // 角色库由后端 config/roles.json 托管，可在「设置 → 角色库」里增删改。
+  // 拉取失败时保持内存里的兜底角色，不阻塞主流程。
+  async function loadRoles() {
+    try {
+      const d = await api('/api/config');
+      const roles = (d && d.roles) || [];
+      if (roles.length) ROLES = roles;
+    } catch (e) {
+      /* 后端不可用时静默沿用兜底角色 */
     }
   }
 
@@ -290,9 +310,36 @@
       nameInput.className = 'input task-item__name-input';
       nameInput.style.cssText = 'height:28px;padding:2px 8px;font-size:12px;max-width:110px';
       nameInput.value = (old[String(i)] && old[String(i)].name) ||
-        (state.mode === 'heterogeneous' ? (ROLE_TEMPLATES[i % ROLE_TEMPLATES.length].name) : 'Agent ' + (i + 1));
+        (state.mode === 'heterogeneous' ? roleDefaultName(i) : 'Agent ' + (i + 1));
 
       head.appendChild(idx);
+
+      if (state.mode === 'heterogeneous') {
+        // 角色下拉：直接选角色库里的角色，选中后自动带出该角色的 requirement 模板
+        const sel = document.createElement('select');
+        sel.className = 'input task-item__role-select';
+        sel.style.cssText = 'height:28px;padding:2px 6px;font-size:12px;max-width:130px';
+        const ph = document.createElement('option');
+        ph.value = '';
+        ph.textContent = '角色…';
+        sel.appendChild(ph);
+        ROLES.forEach((r) => {
+          const op = document.createElement('option');
+          op.value = r.name;
+          op.textContent = r.name;
+          sel.appendChild(op);
+        });
+        sel.value = ROLES.some((r) => r.name === nameInput.value) ? nameInput.value : '';
+        sel.addEventListener('change', () => {
+          const r = ROLES.find((x) => x.name === sel.value);
+          if (!r) return;
+          nameInput.value = r.name;
+          const ta2 = item.querySelector('textarea');
+          if (ta2 && !ta2.value.trim() && r.text) ta2.value = r.text;
+        });
+        head.appendChild(sel);
+      }
+
       head.appendChild(nameInput);
 
       const body = document.createElement('div');
@@ -414,7 +461,7 @@
 
     panes.forEach((p, i) => {
       const br = $('br-' + i);
-      if (br) br.textContent = p.branch || p.worktree || (p.alive ? 'alive' : 'dead');
+      if (br) br.textContent = p.branch || p.role || (p.alive ? 'alive' : 'dead');
       const dot = $('dot-' + i);
       if (dot) {
         dot.style.color = p.alive ? 'var(--c-success)' : 'var(--c-text-faint)';
@@ -475,9 +522,9 @@
           agent: $('selAgent').value,
           count: Number($('rngCount').value),
           repo: $('inpRepo').value.trim() || '.',
-          tasks: tasks,
+          tasks: tasks.map((t) => t.text),
+          roles: tasks.map((t) => t.name),
           broadcast: $('swBroadcast').checked,
-          branch_prefix: 'ai',
         }),
       });
       state.current = d.session;
@@ -517,14 +564,13 @@
 
   async function doStop() {
     if (!state.current) { toast('没有活动会话', 'warn'); return; }
-    if (!confirm('停止会话 ' + state.current + '？这会杀掉 tmux 会话并清理 worktree（如有）。未提交的改动会保留在磁盘上。')) return;
+    if (!confirm('停止会话 ' + state.current + '？这会杀掉 tmux 会话。未提交的改动会保留在磁盘上。')) return;
     try {
       const d = await api('/api/stop', {
         method: 'POST',
-        body: JSON.stringify({ session: state.current, cleanup_worktree: true }),
+        body: JSON.stringify({ session: state.current }),
       });
-      toast('已停止 ' + state.current +
-        (d.worktrees_removed ? '，清理 ' + d.worktrees_removed + ' 个 worktree' : ''), 'ok');
+      toast('已停止 ' + state.current, 'ok');
       stopPolling();
       state.current = null;
       $('paneHost').innerHTML = '<div class="empty"><div class="empty__icon">▦</div>' +
@@ -578,6 +624,317 @@
     };
   }
 
+  // ============================================================ 设置面板
+  // 模型 / API Key / 自定义模型 / 角色库，数据全部来自 /api/config
+  const cfg = { agents: [], roles: [], paths: {} };
+
+  async function loadConfig() {
+    const d = await api('/api/config');
+    cfg.agents = d.agents || [];
+    cfg.roles = d.roles || [];
+    cfg.paths = d.paths || {};
+    if (cfg.roles.length) ROLES = cfg.roles;
+    renderSettings();
+  }
+
+  function renderSettings() {
+    const p = cfg.paths || {};
+    $('setCredPath').textContent =
+      '凭据 ' + (p.credentials || '~/.magent-console/config.json') +
+      (p.config_env ? ' · 由环境变量 ' + p.config_env + ' 指定' : '') +
+      (p.credentials_exists ? ' · 已存在' : ' · 尚未创建');
+    renderAgentAuth();
+    renderCustomList();
+    renderRolesEditor();
+  }
+
+  function statusChip(text, ok) {
+    const s = document.createElement('span');
+    s.className = 'chip ' + (ok ? 'chip--ok' : 'chip--err');
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    s.appendChild(dot);
+    s.appendChild(document.createTextNode(text));
+    return s;
+  }
+
+  function renderAgentAuth() {
+    const host = $('agentAuthList');
+    host.innerHTML = '';
+    cfg.agents.forEach((a) => {
+      const row = document.createElement('div');
+      row.className = 'stack';
+      row.style.cssText = 'gap:6px;padding:8px 0;border-bottom:1px solid var(--c-border)';
+
+      const head = document.createElement('div');
+      head.className = 'row row--wrap';
+      head.style.cssText = 'gap:6px;align-items:center';
+
+      const title = document.createElement('strong');
+      title.style.fontSize = '12px';
+      title.textContent = a.name + (a.custom ? '（自定义）' : '');
+      head.appendChild(title);
+      head.appendChild(statusChip(a.installed ? '已安装' : '未安装', a.installed));
+      if (a.auth_env) {
+        const src = a.authed
+          ? ({ env: '环境变量', file: '本地配置' }[a.auth_source] || a.auth_source || '已设置')
+          : '未鉴权';
+        head.appendChild(statusChip(src, !!a.authed));
+      } else {
+        head.appendChild(statusChip(a.local ? '本地模型 · 无需 Key' : '登录型 · 无需 Key', true));
+      }
+
+      const cmd = document.createElement('code');
+      cmd.className = 'mono t-xs faint';
+      cmd.textContent = a.command || a.cmd || '';
+      head.appendChild(cmd);
+
+      const btnTest = document.createElement('button');
+      btnTest.className = 'btn btn--outlined btn--sm';
+      btnTest.type = 'button';
+      btnTest.textContent = '测试';
+      btnTest.style.marginLeft = 'auto';
+      btnTest.onclick = () => testAgent(a.id, null, btnTest);
+      head.appendChild(btnTest);
+      row.appendChild(head);
+
+      if (a.auth_env) {
+        const line = document.createElement('div');
+        line.className = 'row';
+        line.style.cssText = 'gap:6px;align-items:center';
+
+        const inp = document.createElement('input');
+        inp.className = 'input';
+        inp.type = 'password';
+        inp.autocomplete = 'off';
+        inp.style.cssText = 'height:30px;font-size:12px;flex:1 1 auto';
+        inp.placeholder = a.auth_value_masked
+          ? ('已保存 ' + a.auth_value_masked + '，留空则不改')
+          : (a.auth_env + ' 的值，或 env:变量名（不落盘）');
+        line.appendChild(inp);
+
+        const btnSave = document.createElement('button');
+        btnSave.className = 'btn btn--filled btn--sm';
+        btnSave.type = 'button';
+        btnSave.textContent = '保存';
+        btnSave.onclick = async () => {
+          const v = inp.value.trim();
+          if (!v) { toast('留空表示不修改，请输入 Key 或 env:变量名', 'err'); return; }
+          btnSave.disabled = true;
+          try {
+            await api('/api/config', {
+              method: 'POST',
+              body: JSON.stringify({ agent_auth: { [a.id]: v } }),
+            });
+            inp.value = '';
+            await loadConfig();
+            await loadAgents();
+            toast(a.name + ' 的密钥已保存到 ' + (cfg.paths.credentials || '配置'));
+          } catch (e) {
+            toast('保存失败：' + e.message, 'err');
+          } finally { btnSave.disabled = false; }
+        };
+        line.appendChild(btnSave);
+
+        const btnClear = document.createElement('button');
+        btnClear.className = 'btn btn--text btn--sm';
+        btnClear.type = 'button';
+        btnClear.textContent = '清除';
+        btnClear.onclick = async () => {
+          try {
+            await api('/api/config', {
+              method: 'POST',
+              body: JSON.stringify({ agent_auth: { [a.id]: '' } }),
+            });
+            inp.value = '';
+            await loadConfig();
+            await loadAgents();
+            toast('已清除 ' + a.name + ' 的本地密钥');
+          } catch (e) { toast('清除失败：' + e.message, 'err'); }
+        };
+        line.appendChild(btnClear);
+        row.appendChild(line);
+      }
+
+      if (!a.installed && a.install_hint) {
+        const hint = document.createElement('div');
+        hint.className = 't-xs faint';
+        hint.style.whiteSpace = 'pre-wrap';
+        hint.textContent = '安装提示：' + a.install_hint;
+        row.appendChild(hint);
+      }
+      host.appendChild(row);
+    });
+  }
+
+  async function testAgent(id, spec, btn) {
+    if (btn) btn.disabled = true;
+    try {
+      const d = await api('/api/config/test', {
+        method: 'POST',
+        body: JSON.stringify(spec ? { agent: id, spec: spec } : { agent: id }),
+      });
+      toast(d.message || '测试完成', d.ok ? 'ok' : 'err');
+    } catch (e) {
+      toast('测试失败：' + e.message, 'err');
+    } finally { if (btn) btn.disabled = false; }
+  }
+
+  function renderCustomList() {
+    const host = $('customList');
+    host.innerHTML = '';
+    const customs = cfg.agents.filter((a) => a.custom);
+    if (!customs.length) {
+      const empty = document.createElement('div');
+      empty.className = 't-xs faint';
+      empty.textContent = '暂无自定义模型';
+      host.appendChild(empty);
+      return;
+    }
+    customs.forEach((a) => {
+      const row = document.createElement('div');
+      row.className = 'row row--wrap';
+      row.style.cssText = 'gap:6px;align-items:center;padding:6px 0;border-bottom:1px solid var(--c-border)';
+
+      const t = document.createElement('strong');
+      t.style.fontSize = '12px';
+      t.textContent = a.name;
+      row.appendChild(t);
+
+      const c = document.createElement('code');
+      c.className = 'mono t-xs faint';
+      c.textContent = a.command || a.cmd || '';
+      row.appendChild(c);
+
+      const bt = document.createElement('button');
+      bt.className = 'btn btn--outlined btn--sm';
+      bt.type = 'button';
+      bt.textContent = '测试';
+      bt.style.marginLeft = 'auto';
+      bt.onclick = () => testAgent(a.id, null, bt);
+      row.appendChild(bt);
+
+      const bd = document.createElement('button');
+      bd.className = 'btn btn--danger btn--sm';
+      bd.type = 'button';
+      bd.textContent = '删除';
+      bd.onclick = async () => {
+        const rest = cfg.agents.filter((x) => x.custom && x.id !== a.id)
+          .map((x) => ({
+            id: x.id, name: x.name, cmd: x.cmd, model: x.model || '',
+            args: x.args || [], auth_env: x.auth_env || '', local: !!x.local,
+            install_hint: x.install_hint || '', probe_url: x.probe_url || '',
+          }));
+        try {
+          await api('/api/config', {
+            method: 'POST',
+            body: JSON.stringify({ custom_agents: rest }),
+          });
+          await loadConfig();
+          await loadAgents();
+          toast('已删除 ' + a.name);
+        } catch (e) { toast('删除失败：' + e.message, 'err'); }
+      };
+      row.appendChild(bd);
+      host.appendChild(row);
+    });
+  }
+
+  function renderRolesEditor() {
+    const host = $('roleList');
+    host.innerHTML = '';
+    cfg.roles.forEach((r, i) => {
+      const box = document.createElement('div');
+      box.className = 'stack';
+      box.style.cssText = 'gap:4px;padding:6px 0;border-bottom:1px solid var(--c-border)';
+
+      const line = document.createElement('div');
+      line.className = 'row';
+      line.style.cssText = 'gap:6px;align-items:center';
+
+      const nm = document.createElement('input');
+      nm.className = 'input';
+      nm.type = 'text';
+      nm.value = r.name || '';
+      nm.placeholder = '角色名';
+      nm.style.cssText = 'height:30px;font-size:12px;flex:1 1 auto';
+      nm.oninput = () => { r.name = nm.value; };
+      line.appendChild(nm);
+
+      const del = document.createElement('button');
+      del.className = 'btn btn--danger btn--sm';
+      del.type = 'button';
+      del.textContent = '删除';
+      del.onclick = () => { cfg.roles.splice(i, 1); renderRolesEditor(); };
+      line.appendChild(del);
+      box.appendChild(line);
+
+      const ta = document.createElement('textarea');
+      ta.className = 'input';
+      ta.rows = 3;
+      ta.style.cssText = 'font-size:11px;line-height:1.5;resize:vertical';
+      ta.placeholder = '该角色的 requirement 模板';
+      ta.value = r.requirement || r.text || '';
+      ta.oninput = () => { r.requirement = ta.value; };
+      box.appendChild(ta);
+
+      host.appendChild(box);
+    });
+  }
+
+  async function saveCustomAgent(ev) {
+    ev.preventDefault();
+    const id = $('cfId').value.trim();
+    const cmd = $('cfCmd').value.trim();
+    if (!id || !cmd) { toast('id 与启动命令必填', 'err'); return; }
+
+    const modelRaw = $('cfModel').value.trim();
+    const asArgs = modelRaw.startsWith('-');
+    const spec = {
+      id: id,
+      name: $('cfName').value.trim() || id,
+      cmd: cmd,
+      model: asArgs ? '' : modelRaw,
+      args: asArgs ? modelRaw.split(/\s+/).filter(Boolean) : [],
+      auth_env: $('cfAuthEnv').value.trim() || '',
+      probe_url: $('cfProbe').value.trim() || '',
+      install_hint: $('cfHint').value.trim() || '',
+      local: !!$('cfLocal').checked,
+    };
+
+    const merged = cfg.agents.filter((a) => a.custom && a.id !== id)
+      .map((a) => ({
+        id: a.id, name: a.name, cmd: a.cmd, model: a.model || '',
+        args: a.args || [], auth_env: a.auth_env || '', local: !!a.local,
+        install_hint: a.install_hint || '', probe_url: a.probe_url || '',
+      }));
+    merged.push(spec);
+
+    try {
+      await api('/api/config', {
+        method: 'POST',
+        body: JSON.stringify({ custom_agents: merged }),
+      });
+      $('formCustom').reset();
+      await loadConfig();
+      await loadAgents();
+      toast('已保存自定义模型 ' + spec.name + '，可在 agent 下拉框中选择');
+    } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  }
+
+  async function saveRoles() {
+    const roles = cfg.roles.map((r) => ({
+      id: r.id, name: (r.name || '').trim(), requirement: r.requirement || '',
+    })).filter((r) => r.name);
+    if (!roles.length) { toast('角色库不能为空', 'err'); return; }
+    try {
+      await api('/api/config', { method: 'POST', body: JSON.stringify({ roles: roles }) });
+      await loadConfig();
+      if (state.mode === 'heterogeneous') renderTasks(Number($('rngCount').value));
+      toast('角色库已保存（' + roles.length + ' 个角色）');
+    } catch (e) { toast('保存角色库失败：' + e.message, 'err'); }
+  }
+
   // ============================================================ 事件绑定
   function bind() {
     // 模式卡片
@@ -615,7 +972,7 @@
           }
           if (nm) nm.value = 'Agent ' + (i + 1);
         } else {
-          const tpl = ROLE_TEMPLATES[i % ROLE_TEMPLATES.length];
+          const tpl = ROLES[i % ROLES.length] || { name: 'Agent ' + (i + 1), text: '' };
           if (nm) nm.value = tpl.name;
           if (!ta.value.trim()) ta.value = tpl.text;
         }
@@ -653,7 +1010,39 @@
       if ($('swAuto').checked) startPolling(); else stopPolling();
     });
 
+    // ---- 设置抽屉 ----
+    $('btnSettings').addEventListener('click', async () => {
+      openDrawer(true);
+      try { await loadConfig(); }
+      catch (e) { toast('配置加载失败：' + e.message, 'err'); }
+    });
+    $('btnDrawerClose').addEventListener('click', () => openDrawer(false));
+    $('drawerMask').addEventListener('click', () => openDrawer(false));
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') openDrawer(false);
+    });
+    document.querySelectorAll('#drawerSettings .tab').forEach((tab) => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('#drawerSettings .tab').forEach((t) => t.classList.remove('is-active'));
+        document.querySelectorAll('#drawerBody .tab-pane').forEach((p) => p.classList.remove('is-active'));
+        tab.classList.add('is-active');
+        const pane = document.querySelector('#drawerBody .tab-pane[data-pane="' + tab.getAttribute('data-tab') + '"]');
+        if (pane) pane.classList.add('is-active');
+      });
+    });
+    $('formCustom').addEventListener('submit', saveCustomAgent);
+    $('btnRoleAdd').addEventListener('click', () => {
+      cfg.roles.push({ id: 'role-' + Date.now(), name: '', requirement: '' });
+      renderRolesEditor();
+    });
+    $('btnRoleSave').addEventListener('click', saveRoles);
+
     window.addEventListener('beforeunload', stopPolling);
+  }
+
+  function openDrawer(open) {
+    $('drawerSettings').hidden = !open;
+    $('drawerMask').hidden = !open;
   }
 
   // ============================================================ 启动
@@ -683,6 +1072,7 @@
     }
 
     await loadAgents();
+    await loadRoles();
     await loadProfile();
     await loadSessions();
     if (state.current) startPolling();

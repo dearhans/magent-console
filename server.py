@@ -13,12 +13,15 @@ API:
     GET  /api/health                 健康检查
     GET  /api/profile?cols=&rows=    本机性能评估与 agent 数推荐
     GET  /api/agents                 agent CLI 注册表与可用性
+    GET  /api/config                 读取配置（角色库 + 自定义 agent + 密钥占位）
+    POST /api/config                 保存配置（凭据落盘到 ~/.magent-console/config.json）
+    POST /api/config/test            测试某个 agent/模型的可用性与鉴权连通性
     GET  /api/sessions               tmux 会话列表
     GET  /api/status?session=&lines= 各 pane 实时状态与输出
     GET  /api/diff?session=          各 pane 的 git 改动汇总
     POST /api/launch                 启动编排
     POST /api/send                   向某 pane 或全体发指令
-    POST /api/stop                   停止会话并清理 worktree
+    POST /api/stop                   停止会话
     POST /api/grab                   把某 pane 输出落盘
 """
 
@@ -40,6 +43,7 @@ sys.path.insert(0, str(HERE))
 
 from core.benchmark import collect as collect_profile       # noqa: E402
 from core.agents import list_agents, resolve_command        # noqa: E402
+from core import config as config_mod                       # noqa: E402
 from core.tmuxctl import Tmux, TmuxError                    # noqa: E402
 from core.orchestrator import Orchestrator, LaunchConfig    # noqa: E402
 
@@ -162,7 +166,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self._write_json(_ok(prof))
 
             if route == "agents":
+                config_mod.sync_registry()
                 return self._write_json(_ok({"agents": list_agents()}))
+
+            if route == "config":
+                config_mod.sync_registry()
+                return self._write_json(_ok(config_mod.build_config_view()))
 
             if route == "sessions":
                 if not TMUX.available():
@@ -200,19 +209,33 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         body = self._read_json()
 
         try:
+            if route == "config":
+                return self._write_json(_ok(config_mod.save_config(body)))
+
+            if route == "config/test":
+                agent_id = body.get("agent", "")
+                if not agent_id:
+                    return self._write_json(_err("缺少 agent 参数", 400), 400)
+                return self._write_json(
+                    _ok(config_mod.test_agent(agent_id, body.get("config"))))
+
             if route == "launch":
                 if not TMUX.available():
                     return self._write_json(
                         _err("tmux 未安装。请运行 ./install.sh，或 sudo apt install tmux", 503), 503)
+                # 前端传的是 {name,text} 结构，后端只取 text 注入 tmux
+                raw_tasks = body.get("tasks", []) or []
+                tasks = [(t if isinstance(t, str) else str((t or {}).get("text", "") or ""))
+                         for t in raw_tasks]
                 cfg = LaunchConfig(
                     mode=body.get("mode", "parallel"),
                     agent=body.get("agent", "claude"),
                     count=int(body.get("count", 4)),
                     repo=body.get("repo", ".") or ".",
-                    tasks=body.get("tasks", []) or [],
+                    tasks=tasks,
+                    roles=[str(r or "") for r in (body.get("roles", []) or [])],
                     broadcast=bool(body.get("broadcast", True)),
                     session=body.get("session") or None,
-                    branch_prefix=body.get("branch_prefix", "ai"),
                 )
                 info = ORCH.launch(cfg)
                 info["command"] = resolve_command(cfg.agent)
@@ -232,8 +255,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 session = body.get("session", "")
                 if not session:
                     return self._write_json(_err("缺少 session", 400), 400)
-                cleanup = bool(body.get("cleanup_worktree", True))
-                return self._write_json(_ok(ORCH.stop(session, cleanup)))
+                return self._write_json(_ok(ORCH.stop(session)))
 
             if route == "grab":
                 session = body.get("session", "")
@@ -273,6 +295,18 @@ def main() -> int:
     if not (STATIC_DIR / "index.html").is_file():
         print("[!] 未找到前端文件：%s" % (STATIC_DIR / "index.html"))
         print("    请确认 static/ 目录完整")
+
+    # 启动时：把「自定义 agent / 模型」注册进注册表，并注入已保存的 API Key
+    try:
+        config_mod.sync_registry()
+    except Exception as e:                          # noqa: BLE001
+        print("[!] 载入自定义 agent 配置失败：%s" % e)
+    try:
+        injected = config_mod.apply_auth_env()
+        if injected:
+            print("  已注入凭据 : %s" % ", ".join(injected))
+    except Exception as e:                          # noqa: BLE001
+        print("[!] 注入已保存凭据失败：%s" % e)
 
     srv = ThreadingHTTPServer((host, args.port), ConsoleHandler)
     url = "http://%s:%d" % ("localhost" if host == "0.0.0.0" else host, args.port)

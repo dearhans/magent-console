@@ -15,3 +15,12 @@ temp/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 凭据配置（含 API Key）—— 存于 ~/.magent-console/config.json，
+# 该文件不在仓库内，此处仅为防止误复制进项目目录而设的多道防线。
+# 支持 MAGENT_CONFIG 环境变量覆盖路径，若你把配置重定向到项目内，
+# 这条规则能确保它永远不会进 git。
+config.json
+.magent-console/
+*.key
+.env

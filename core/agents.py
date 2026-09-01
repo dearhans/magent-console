@@ -29,6 +29,10 @@ class AgentSpec:
     local: bool = False             # True = 本地模型，吃本地算力
     default_args: List[str] = field(default_factory=list)
     doc_url: str = ""
+    # --- 以下字段服务于「自定义 agent / 自定义模型」 ---
+    model: str = ""                 # 模型名/标识，用于展示与连通性探测
+    probe_url: str = ""             # 自定义探测端点（留空则用内置映射）
+    custom: bool = False            # True = 用户自定义，非内置
 
     def resolved_cmd(self) -> str:
         args = " ".join(self.default_args)
@@ -93,8 +97,11 @@ def _run(cmd: List[str], timeout: float = 4.0):
         return -1, ""
 
 
-def detect(spec: AgentSpec) -> Dict:
-    """检测单个 agent 的安装与鉴权状态。"""
+def detect(spec: AgentSpec, key: Optional[str] = None) -> Dict:
+    """检测单个 agent 的安装与鉴权状态。
+
+    key 显式传入密钥时以它为准；为 None 时才回落到读取 auth_env 环境变量。
+    """
     binary = spec.cmd.split()[0]
     path = shutil.which(binary)
     installed = path is not None
@@ -106,7 +113,10 @@ def detect(spec: AgentSpec) -> Dict:
             version = out.splitlines()[0][:60]
 
     authed: Optional[bool] = None
-    if spec.auth_env:
+    if key is not None:
+        # 显式密钥优先（来自 ~/.magent-console/config.json 或 env:XXX 引用）
+        authed = bool(key)
+    elif spec.auth_env:
         val = os.environ.get(spec.auth_env, "")
         authed = bool(val)
     elif installed:
@@ -128,6 +138,9 @@ def detect(spec: AgentSpec) -> Dict:
         "install_npm": spec.install_npm,
         "install_shell": spec.install_shell,
         "doc_url": spec.doc_url,
+        "model": spec.model,
+        "custom": spec.custom,
+        "probe_url": spec.probe_url,
     }
 
 
@@ -135,13 +148,37 @@ def list_agents() -> List[Dict]:
     return [detect(AGENTS[k]) for k in AGENTS]
 
 
+# ---------------------------------------------------------------- 自定义注册
+_CUSTOM: Dict[str, AgentSpec] = {}
+
+
+def reset_custom() -> None:
+    """清空已注册的自定义 agent（保持内置 AGENTS 不变）。"""
+    _CUSTOM.clear()
+
+
+def register_custom(spec: AgentSpec) -> None:
+    """注册一个自定义 agent/模型，使其在 AGENTS 视图中可见。"""
+    if not spec or not spec.id:
+        return
+    spec.custom = True
+    _CUSTOM[spec.id] = spec
+
+
+def registered_agents() -> Dict[str, AgentSpec]:
+    """内置 + 自定义 的合并视图（自定义可覆盖同名内置项）。"""
+    merged = dict(AGENTS)
+    merged.update(_CUSTOM)
+    return merged
+
+
 def get(agent_id: str) -> Optional[AgentSpec]:
-    return AGENTS.get(agent_id)
+    return registered_agents().get(agent_id)
 
 
 def resolve_command(agent_id: str) -> str:
     """返回可在 tmux pane 里执行的启动命令。未知 id 则原样返回（允许自定义命令）。"""
-    spec = AGENTS.get(agent_id)
+    spec = registered_agents().get(agent_id)
     return spec.resolved_cmd() if spec else agent_id
 
 

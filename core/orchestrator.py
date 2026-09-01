@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/orchestrator.py — 三种编排模式的实现
+core/orchestrator.py — 两种编排模式的实现
 
 模式一 parallel      并行同质（Best-of-N）
     同一份 requirement 广播给 N 个 agent，各自独立产出，人工挑最优。
@@ -11,11 +11,13 @@ core/orchestrator.py — 三种编排模式的实现
     N 个 agent 各领一份不同的 requirement（写码 / 测试 / review / 查文档），
     关闭广播，逐个定向注入。
 
-模式三 worktree      Git worktree 隔离（生产级并发）
-    每个 agent 分配独立 git worktree 与分支，物理上杜绝写冲突。
-    这是唯一能安全让多个 agent 同时改同一个仓库的模式。
+两种模式共用同一套「启动 → 注入 → 监控 → 收尾」生命周期。
 
-三种模式共用同一套「启动 → 注入 → 监控 → 收尾」生命周期。
+注：本文件曾实现过第三种「git worktree 隔离」模式，已整体移除。
+理由：该模式并非 Omarchy 官方能力，属于本项目自行追加的实验特性，
+实际使用中会为每个 agent 复制一份工作副本，带来额外的磁盘与心智负担，
+且与「并行同质 / 异质分工」两套模式在生命周期上高度耦合，维护成本高于收益。
+移除后不留死代码，模式集合以 MODES 为准。
 """
 
 from __future__ import annotations
@@ -27,10 +29,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .agents import resolve_command, get
+from .agents import resolve_command
 from .tmuxctl import Tmux, TmuxError
 
-MODES = ("parallel", "heterogeneous", "worktree")
+MODES = ("parallel", "heterogeneous")
 
 
 @dataclass
@@ -38,19 +40,17 @@ class LaunchConfig:
     mode: str = "parallel"
     agent: str = "claude"
     count: int = 4
-    repo: str = "."                      # 工作目录（worktree 模式下须是 git 仓库）
+    repo: str = "."                      # 工作目录
     tasks: List[str] = field(default_factory=list)   # 每个 pane 的 requirement
+    roles: List[str] = field(default_factory=list)   # 每个 pane 的角色名（仅作标注，异质分工模式用）
     broadcast: bool = True               # parallel 模式下是否开启输入同步
     session: Optional[str] = None        # 会话名，留空自动生成
-    branch_prefix: str = "ai"
 
     def validate(self) -> None:
         if self.mode not in MODES:
             raise ValueError(f"未知模式 {self.mode}，可选：{', '.join(MODES)}")
         if self.count < 1 or self.count > 16:
             raise ValueError("agent 数量须在 1~16 之间")
-        if self.mode == "worktree" and not os.path.isdir(os.path.join(self.repo, ".git")):
-            raise ValueError(f"worktree 模式要求 {self.repo} 是 git 仓库（未找到 .git）")
         if self.mode == "heterogeneous" and len(self.tasks) > self.count:
             raise ValueError("任务条数不能多于 agent 数量")
 
@@ -79,33 +79,20 @@ class Orchestrator:
 
         session = cfg.session or self._session_name(cfg)
         cmd = resolve_command(cfg.agent)
-        spec = get(cfg.agent)
-
-        if spec and spec.local and cfg.mode == "worktree":
-            raise ValueError("本地模型（Ollama）不适合 worktree 并发模式："
-                             "每个实例都要独立加载权重，内存会爆")
-
-        worktrees: List[str] = []
 
         # 第 1 个 pane：主副本
         self.tmux.ensure_session(session, repo)
         self.tmux.send_keys(f"{session}:0.0", cmd, enter=True)
 
-        # 其余 pane
+        # 其余 pane：两种模式下都在同一份工作目录里启动
         for i in range(1, cfg.count):
-            if cfg.mode == "worktree":
-                wt_path = self._make_worktree(repo, cfg.branch_prefix, i)
-                worktrees.append(wt_path)
-                cwd = wt_path
-            else:
-                cwd = repo
-            self.tmux.split(f"{session}:0", cwd)
+            self.tmux.split(f"{session}:0", repo)
             self.tmux.send_keys(f"{session}:0.{i}", cmd, enter=True)
             self.tmux.select_layout(session, "tiled")
 
         self.tmux.select_layout(session, "tiled")
 
-        # 广播开关
+        # 广播开关：只有并行同质模式才允许同步输入
         if cfg.mode == "parallel":
             self.tmux.set_sync(session, cfg.broadcast)
         else:
@@ -121,13 +108,12 @@ class Orchestrator:
             "agent": cfg.agent,
             "count": cfg.count,
             "repo": repo,
-            "worktrees": worktrees,
             "sync": self.tmux.get_sync(session),
             "panes": [
                 {"index": i,
-                 "cwd": (worktrees[i - 1] if cfg.mode == "worktree" and i > 0 else repo),
-                 "task": cfg.tasks[i] if i < len(cfg.tasks) else (
-                     cfg.tasks[0] if cfg.mode == "parallel" and cfg.tasks else "")}
+                 "cwd": repo,
+                 "task": cfg.tasks[i] if i < len(cfg.tasks) else (cfg.tasks[0] if cfg.mode == "parallel" and cfg.tasks else ""),
+                 "role": cfg.roles[i] if i < len(cfg.roles) else ""}
                 for i in range(cfg.count)
             ],
         }
@@ -136,22 +122,6 @@ class Orchestrator:
         base = os.path.basename(os.path.abspath(os.path.expanduser(cfg.repo))) or "work"
         base = re.sub(r"[^A-Za-z0-9_-]", "-", base)
         return f"magent-{cfg.mode[:4]}-{base}"[:40]
-
-    def _make_worktree(self, repo: str, prefix: str, idx: int) -> str:
-        stamp = time.strftime("%m%d")
-        branch = f"{prefix}/wt{idx}-{stamp}"
-        path = os.path.join("/tmp", f"{os.path.basename(repo)}-wt{idx}-{stamp}")
-        # 已存在则先清理，保证幂等
-        subprocess.run(["git", "-C", repo, "worktree", "remove", "-f", path],
-                       capture_output=True, text=True)
-        subprocess.run(["git", "-C", repo, "branch", "-D", branch],
-                       capture_output=True, text=True)
-        p = subprocess.run(
-            ["git", "-C", repo, "worktree", "add", "-f", path, "-b", branch],
-            capture_output=True, text=True)
-        if p.returncode != 0:
-            raise TmuxError(f"创建 git worktree 失败：{p.stderr.strip()}")
-        return path
 
     def _inject_tasks(self, session: str, cfg: LaunchConfig) -> None:
         if not cfg.tasks:
@@ -166,7 +136,7 @@ class Orchestrator:
                 for i in range(cfg.count):
                     self.tmux.send_keys(f"{session}:0.{i}", text)
         else:
-            # 异质 / worktree：第 i 个 pane 领第 i 份任务
+            # 异质分工：第 i 个 pane 领第 i 份任务
             for i, task in enumerate(cfg.tasks):
                 if i >= cfg.count or not task.strip():
                     break
@@ -216,21 +186,9 @@ class Orchestrator:
         self.tmux.send_keys(f"{session}:0.{pane}", text)
         return {"sent": "pane", "pane": pane}
 
-    def stop(self, session: str, cleanup_worktree: bool = True) -> Dict:
-        panes = self.tmux.list_panes(session)
-        dirs = [p["cwd"] for p in panes]
+    def stop(self, session: str) -> Dict:
         self.tmux.kill_session(session)
-
-        removed = []
-        if cleanup_worktree:
-            for d in dirs:
-                if "/tmp/" in d and "-wt" in d:
-                    repo = self._main_repo_of_worktree(d)
-                    if repo:
-                        subprocess.run(["git", "-C", repo, "worktree", "remove", "-f", d],
-                                       capture_output=True, text=True)
-                        removed.append(d)
-        return {"session": session, "stopped": True, "worktrees_removed": removed}
+        return {"session": session, "stopped": True}
 
     # ------------------------------------------------------------ 差异汇总
     def diff(self, session: str) -> Dict:
@@ -275,17 +233,3 @@ class Orchestrator:
         except Exception:
             return ""
 
-    @staticmethod
-    def _main_repo_of_worktree(wt_path: str) -> Optional[str]:
-        try:
-            r = subprocess.run(["git", "-C", wt_path, "rev-parse",
-                                "--git-common-dir"],
-                               capture_output=True, text=True, timeout=4)
-            if r.returncode != 0:
-                return None
-            common = (r.stdout or "").strip()
-            if not os.path.isabs(common):
-                common = os.path.join(wt_path, common)
-            return os.path.dirname(os.path.abspath(common))
-        except Exception:
-            return None

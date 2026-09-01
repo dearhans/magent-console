@@ -21,6 +21,7 @@
   <div class="app-bar__actions">
     <span class="chip" id="chipTmux"><span class="dot"></span>tmux</span>
     <span class="chip" id="chipSessions">0 会话</span>
+    <button class="btn btn--outlined btn--sm" id="btnSettings" title="模型 / API Key / 角色库">设置</button>
     <button class="btn btn--outlined btn--sm" id="btnTheme" title="切换亮/暗主题">主题</button>
     <button class="btn btn--text btn--sm" id="btnRefresh" title="重新检测">刷新</button>
   </div>
@@ -153,26 +154,6 @@
           </div>
         </button>
 
-        <button class="mode-card" data-mode="worktree" type="button">
-          <div class="mode-card__icon">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
-              <path d="M5 3v6a3 3 0 003 3h4"></path>
-              <circle cx="5" cy="15" r="2"></circle>
-              <circle cx="15" cy="12" r="2"></circle>
-              <circle cx="15" cy="4" r="2"></circle>
-            </svg>
-          </div>
-          <div class="mode-card__body">
-            <div class="mode-card__title">Worktree 隔离 · 生产级并发</div>
-            <div class="mode-card__desc">每个 Agent 分独立 git worktree 与分支，物理杜绝写冲突。需目标目录是 git 仓库。</div>
-            <span class="mode-card__tag">Omarchy 官方未做 · 但并发改同一仓库必须</span>
-          </div>
-          <div class="mode-viz">
-            <div class="mode-viz__pane" style="height:20px"></div>
-            <div class="mode-viz__pane" style="height:20px"></div>
-            <div class="mode-viz__pane" style="height:20px"></div>
-          </div>
-        </button>
       </div>
 
       <!-- 基本配置 -->
@@ -194,7 +175,7 @@
       <div class="field">
         <label class="field__label" for="inpRepo">工作目录</label>
         <input class="input" type="text" id="inpRepo" placeholder="例如 /home/user/project 或 .">
-        <div class="field__hint">worktree 模式要求该目录是 git 仓库</div>
+        <div class="field__hint">所有 Agent 共用此目录；建议是 git 仓库，以便用 Diff 查看各自改动</div>
       </div>
 
       <div class="row row--between" style="margin-bottom:var(--s-4)">
@@ -267,6 +248,87 @@
   </section>
 
 </main>
+
+  <!-- 设置抽屉 -->
+  <div class="drawer-mask" id="drawerMask" hidden></div>
+  <aside class="drawer" id="drawerSettings" hidden aria-label="设置">
+    <header class="drawer__head">
+      <div>
+        <h2 class="drawer__title">设置</h2>
+        <p class="drawer__subtitle" id="setCredPath">凭据配置 · 加载中…</p>
+      </div>
+      <button class="btn btn--text btn--sm" id="btnDrawerClose" title="关闭">关闭</button>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="agents" role="tab" type="button">模型 / 鉴权</button>
+      <button class="tab" data-tab="custom" role="tab" type="button">自定义模型</button>
+      <button class="tab" data-tab="roles" role="tab" type="button">角色库</button>
+    </nav>
+
+    <div class="drawer__body" id="drawerBody">
+
+      <!-- 模型 / 鉴权 -->
+      <section class="tab-pane is-active" data-pane="agents">
+        <p class="hint-block">填写 API Key 后点击「保存」，密钥写入用户家目录 <code>~/.magent-console/config.json</code>（权限 600，已加入 .gitignore，不会进 git）。
+          也可填 <code>env:变量名</code> 引用环境变量，密钥本身不落盘。</p>
+        <div id="agentAuthList" class="stack"></div>
+      </section>
+
+      <!-- 自定义模型 -->
+      <section class="tab-pane" data-pane="custom">
+        <p class="hint-block">把你自己的 CLI / 本地模型 / 中转接口加进来，保存后它会出现在编排页的 Agent 下拉框里，用法与内置 Agent 完全一致。</p>
+        <form id="formCustom" class="stack">
+          <div class="field">
+            <label class="field__label" for="cfId">标识 id（英文小写，唯一）</label>
+            <input class="input" type="text" id="cfId" placeholder="my-agent" autocomplete="off">
+          </div>
+          <div class="field">
+            <label class="field__label" for="cfName">显示名</label>
+            <input class="input" type="text" id="cfName" placeholder="我的 Agent" autocomplete="off">
+          </div>
+          <div class="field">
+            <label class="field__label" for="cfCmd">启动命令</label>
+            <input class="input" type="text" id="cfCmd" placeholder="my-agent" autocomplete="off">
+          </div>
+          <div class="field">
+            <label class="field__label" for="cfModel">模型名 / 启动参数</label>
+            <input class="input" type="text" id="cfModel" placeholder="--model my-model-7b" autocomplete="off">
+          </div>
+          <div class="field">
+            <label class="field__label" for="cfAuthEnv">鉴权环境变量名（可留空）</label>
+            <input class="input" type="text" id="cfAuthEnv" placeholder="MY_AGENT_API_KEY" autocomplete="off">
+          </div>
+          <div class="field">
+            <label class="field__label" for="cfProbe">连通性探测 URL（可留空）</label>
+            <input class="input" type="text" id="cfProbe" placeholder="https://api.example.com/v1/models" autocomplete="off">
+          </div>
+          <div class="field">
+            <label class="field__label" for="cfHint">安装提示</label>
+            <input class="input" type="text" id="cfHint" placeholder="如何安装 / 从哪获取 Key" autocomplete="off">
+          </div>
+          <label class="check"><input type="checkbox" id="cfLocal"> <span>本地模型（吃本地 CPU/GPU/内存）</span></label>
+          <div class="row row--end">
+            <button class="btn btn--outlined btn--sm" type="reset">清空</button>
+            <button class="btn btn--filled btn--sm" type="submit" id="btnCustomSave">保存自定义模型</button>
+          </div>
+        </form>
+        <div class="divider"></div>
+        <div id="customList" class="stack"></div>
+      </section>
+
+      <!-- 角色库 -->
+      <section class="tab-pane" data-pane="roles">
+        <p class="hint-block">角色 = 名称 + 该角色的任务(requirement)模板。保存在项目内 <code>config/roles.json</code>（可进 git，方便团队共享）。</p>
+        <div id="roleList" class="stack"></div>
+        <div class="row row--end" style="margin-top:var(--s-3)">
+          <button class="btn btn--outlined btn--sm" id="btnRoleAdd" type="button">+ 新增角色</button>
+          <button class="btn btn--filled btn--sm" id="btnRoleSave" type="button">保存角色库</button>
+        </div>
+      </section>
+
+    </div>
+  </aside>
 
 <div class="snackbar-host" id="snackHost"></div>
 

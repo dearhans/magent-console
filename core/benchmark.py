@@ -331,14 +331,98 @@ def gpu_info() -> Dict[str, Any]:
 
 
 
-def disk_info(path: str = ".") -> Dict[str, float]:
+def _project_root() -> str:
+    """本项目根目录（core/ 的上一级），即 server.py 所在目录。"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _decode_mountinfo(field: str) -> str:
+    """mountinfo 里路径字段用八进制转义（\\040 空格、\\011 制表、\\134 反斜杠）。"""
+    return (field.replace("\\040", " ")
+                 .replace("\\011", "\t")
+                 .replace("\\012", "\n")
+                 .replace("\\134", "\\"))
+
+
+def _windows_drive_from_wsl(path: str) -> str:
+    """WSL 下 /mnt/c/... → C:；非 drvfs 挂载返回空串。"""
+    m = re.match(r"^/mnt/([a-zA-Z])(/|$)", path)
+    return (m.group(1).upper() + ":") if m else ""
+
+
+def _mount_of(path: str) -> Dict[str, str]:
+    """在 Linux/WSL 上找出 path 所属挂载点（最长前缀匹配）。
+
+    直接读 /proc/self/mountinfo 而不是解析 df 输出，避免依赖列位置与语言环境。
+    """
+    best_mp = best_fs = best_src = ""
     try:
-        usage = shutil.disk_usage(os.path.abspath(path))
-        return {"total_gb": round(usage.total / 1024 ** 3, 1),
-                "free_gb": round(usage.free / 1024 ** 3, 1),
-                "used_gb": round(usage.used / 1024 ** 3, 1)}
+        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 10:
+                    continue
+                try:
+                    sep = parts.index("-")
+                except ValueError:
+                    continue
+                if sep + 2 >= len(parts):
+                    continue
+                mp = _decode_mountinfo(parts[4])
+                fs = parts[sep + 1]
+                src = parts[sep + 2]
+                if path == mp or path.startswith(mp.rstrip("/") + "/"):
+                    if len(mp) > len(best_mp):
+                        best_mp, best_fs, best_src = mp, fs, src
     except Exception:
-        return {"total_gb": 0.0, "free_gb": 0.0, "used_gb": 0.0}
+        pass
+    return {"mount_point": best_mp, "fstype": best_fs, "device": best_src}
+
+
+def disk_info(path: Optional[str] = None) -> Dict[str, Any]:
+    """检测 path 所在磁盘的真实容量，并带上「这是哪块盘」的定位信息。
+
+    path 省略时默认检测**项目实际所在目录**，而不是 os.path.expanduser("~")：
+    服务跑在 WSL2 里时 home 位于 WSL 虚拟磁盘（/dev/sdc，动辄 1TB 可用），
+    而项目文件其实在 Windows C 盘的 /mnt/c 挂载点下，两者的可用空间完全不是一回事。
+    量错盘会让「磁盘还剩多少」这项指标彻底失真，因此这里必须量项目目录。
+    """
+    target = os.path.abspath(os.path.expanduser(path or _project_root()))
+    out: Dict[str, Any] = {
+        "path": target,
+        "total_gb": 0.0, "free_gb": 0.0, "used_gb": 0.0,
+        "mount_point": "", "fstype": "", "device": "",
+        "drive": "", "label": "", "is_wsl_mount": False,
+    }
+    try:
+        usage = shutil.disk_usage(target)
+        out["total_gb"] = round(usage.total / 1024 ** 3, 1)
+        out["free_gb"] = round(usage.free / 1024 ** 3, 1)
+        out["used_gb"] = round(usage.used / 1024 ** 3, 1)
+    except Exception:
+        return out
+
+    system = platform.system()
+    if system == "Windows":
+        drive = os.path.splitdrive(target)[0]
+        out.update(drive=drive, mount_point=drive, device=drive, fstype="NTFS")
+        out["label"] = f"Windows {drive} 盘" if drive else target
+        return out
+
+    m = _mount_of(target)
+    drive = _windows_drive_from_wsl(target)
+    out.update(mount_point=m["mount_point"], fstype=m["fstype"],
+               device=m["device"], drive=drive,
+               is_wsl_mount=bool(drive))
+    if drive:
+        out["label"] = f"Windows {drive} 盘（WSL 挂载于 {m['mount_point'] or target}）"
+    elif m["mount_point"] == "/":
+        out["label"] = "WSL2 虚拟磁盘（根挂载点 /）"
+    elif m["mount_point"]:
+        out["label"] = f"挂载点 {m['mount_point']}"
+    else:
+        out["label"] = target
+    return out
 
 
 def environment_info() -> Dict[str, Any]:
@@ -431,7 +515,6 @@ def recommend(profile: Dict[str, Any],
 
     mem_avail = float(mem.get("available_mb", 0))
     cores = int(cpu.get("cores", 1) or 1)
-    free_gb = float(disk.get("free_gb", 0) or 0)
 
     # ---- 云端模式约束 ----
     usable_mem = max(mem_avail - MEM_RESERVED_FOR_OS_MB, 0)
@@ -513,10 +596,12 @@ def recommend(profile: Dict[str, Any],
             f"当前终端 {terminal_cols}×{terminal_rows}，按每 pane ≥{MIN_PANE_COLS}×{MIN_PANE_ROWS} "
             f"字符计 → 上限 {rec.screen_limit} 个"
         )
-    if free_gb < 5:
+    disk_free_gb = float(disk.get("free_gb", 0) or 0)
+    if disk_free_gb < 5:
         rec.reasons.append(
-            f"⚠ 磁盘仅剩 {free_gb}GB，worktree 隔离模式需要为每个 agent 复制一份工作副本，"
-            f"空间可能不足，建议改用并行模式"
+            f"⚠ 项目所在磁盘（{disk.get('label') or disk.get('path') or '未知'}）"
+            f"仅剩 {disk_free_gb}GB，agent 写代码、装依赖、跑构建都需要落盘空间，"
+            f"建议先清理到 10GB 以上再开工"
         )
     rec.reasons.append(f"综合瓶颈：{rec.bottleneck}")
 
@@ -531,7 +616,7 @@ def collect(terminal_cols: Optional[int] = None,
         "cpu": cpu_info(),
         "memory": memory_info(),
         "gpu": gpu_info(),
-        "disk": disk_info(os.path.expanduser("~")),
+        "disk": disk_info(_project_root()),
         "environment": environment_info(),
         "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
