@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magent Console — 多 Agent 编排控制台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============================================ App Bar -->
+<header class="app-bar">
+  <div class="app-bar__brand">
+    <div class="app-bar__logo">M</div>
+    <div>
+      <div class="app-bar__title">Magent Console</div>
+      <div class="app-bar__subtitle">多 Agent 编排控制台 · tmux 驱动</div>
+    </div>
+  </div>
+  <div class="app-bar__spacer"></div>
+  <div class="app-bar__actions">
+    <span class="chip" id="chipTmux"><span class="dot"></span>tmux</span>
+    <span class="chip" id="chipSessions">0 会话</span>
+    <button class="btn btn--outlined btn--sm" id="btnTheme" title="切换亮/暗主题">主题</button>
+    <button class="btn btn--text btn--sm" id="btnRefresh" title="重新检测">刷新</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ============================================ 左：性能评估 -->
+  <section class="panel panel--perf">
+    <div class="panel__head">
+      <h2 class="panel__title">本机性能评估</h2>
+      <span class="spacer"></span>
+      <span class="panel__hint" id="perfTime"></span>
+    </div>
+    <div class="panel__body">
+
+      <!-- 仪表盘 -->
+      <div class="gauge">
+        <div class="gauge__ring">
+          <svg width="116" height="116" viewBox="0 0 116 116" aria-hidden="true">
+            <circle class="gauge__ring-bg" cx="58" cy="58" r="48"></circle>
+            <circle class="gauge__ring-fg" id="gaugeRing" cx="58" cy="58" r="48"
+                    stroke-dasharray="301.6" stroke-dashoffset="301.6"></circle>
+          </svg>
+          <div class="gauge__center">
+            <div class="gauge__grade" id="gaugeGrade">—</div>
+            <div class="gauge__label">GRADE</div>
+          </div>
+        </div>
+        <div class="gauge__meta">
+          <div class="gauge__recommend">
+            推荐并行 <strong id="recCount">—</strong> 个 Agent
+          </div>
+          <div class="gauge__recommend faint t-xs" id="recLocal"></div>
+          <div class="bottleneck" id="bottleneck">
+            <span>⏳</span><span>正在评估…</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 硬件指标 -->
+      <div class="metric-grid">
+        <div class="metric">
+          <div class="metric__label">CPU</div>
+          <div class="metric__value" id="mCpu">—</div>
+          <div class="metric__sub" id="mCpuSub"></div>
+        </div>
+        <div class="metric">
+          <div class="metric__label">内存</div>
+          <div class="metric__value" id="mMem">—</div>
+          <div class="bar"><div class="bar__fill" id="mMemBar" style="width:0%"></div></div>
+          <div class="metric__sub" id="mMemSub"></div>
+        </div>
+        <div class="metric">
+          <div class="metric__label">GPU</div>
+          <div class="metric__value" id="mGpu">—</div>
+          <div class="metric__sub" id="mGpuSub"></div>
+        </div>
+        <div class="metric">
+          <div class="metric__label">磁盘可用</div>
+          <div class="metric__value" id="mDisk">—</div>
+          <div class="bar"><div class="bar__fill" id="mDiskBar" style="width:0%"></div></div>
+          <div class="metric__sub" id="mDiskSub"></div>
+        </div>
+      </div>
+
+      <!-- 评分与理由 -->
+      <div class="row row--between" style="margin-bottom:8px">
+        <span class="t-sm dim">综合评分</span>
+        <span class="mono" id="mScore">—</span>
+      </div>
+      <ul class="reason-list" id="reasonList"></ul>
+
+      <div class="divider"></div>
+
+      <!-- Agent 可用性 -->
+      <div class="field__label" style="margin-bottom:8px">Agent 可用性</div>
+      <div id="agentList" class="row row--wrap" style="gap:6px"></div>
+    </div>
+  </section>
+
+  <!-- ============================================ 中：编排配置 -->
+  <section class="panel panel--orchestrate">
+    <div class="panel__head">
+      <h2 class="panel__title">编排配置</h2>
+      <span class="spacer"></span>
+      <span class="panel__hint">选模式 → 设数量 → 写 requirement → 启动</span>
+    </div>
+    <div class="panel__body">
+
+      <!-- 模式选择 -->
+      <div class="mode-cards">
+        <button class="mode-card is-active" data-mode="parallel" type="button">
+          <div class="mode-card__icon">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+              <rect x="2" y="3" width="6" height="14" rx="1.5"></rect>
+              <rect x="12" y="3" width="6" height="14" rx="1.5"></rect>
+            </svg>
+          </div>
+          <div class="mode-card__body">
+            <div class="mode-card__title">并行同质 · Best-of-N</div>
+            <div class="mode-card__desc">同一份 requirement 广播给 N 个 Agent，各自独立产出，人工挑最优解。</div>
+            <span class="mode-card__tag">开启 synchronize-panes · 一条指令全员收到</span>
+          </div>
+          <div class="mode-viz">
+            <div class="mode-viz__pane"></div>
+            <div class="mode-viz__pane"></div>
+            <div class="mode-viz__pane"></div>
+            <div class="mode-viz__pane"></div>
+          </div>
+        </button>
+
+        <button class="mode-card" data-mode="heterogeneous" type="button">
+          <div class="mode-card__icon">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+              <rect x="2" y="3" width="16" height="4" rx="1.5"></rect>
+              <rect x="2" y="8" width="10" height="4" rx="1.5"></rect>
+              <rect x="2" y="13" width="13" height="4" rx="1.5"></rect>
+            </svg>
+          </div>
+          <div class="mode-card__body">
+            <div class="mode-card__title">异质分工 · 各领一份</div>
+            <div class="mode-card__desc">N 个 Agent 各领不同 requirement：写码 / 测试 / review / 查文档，定向投喂。</div>
+            <span class="mode-card__tag">关闭广播 · 逐个定向注入</span>
+          </div>
+          <div class="mode-viz">
+            <div class="mode-viz__pane" style="height:22px"></div>
+            <div class="mode-viz__pane" style="height:14px"></div>
+            <div class="mode-viz__pane" style="height:28px"></div>
+          </div>
+        </button>
+
+        <button class="mode-card" data-mode="worktree" type="button">
+          <div class="mode-card__icon">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M5 3v6a3 3 0 003 3h4"></path>
+              <circle cx="5" cy="15" r="2"></circle>
+              <circle cx="15" cy="12" r="2"></circle>
+              <circle cx="15" cy="4" r="2"></circle>
+            </svg>
+          </div>
+          <div class="mode-card__body">
+            <div class="mode-card__title">Worktree 隔离 · 生产级并发</div>
+            <div class="mode-card__desc">每个 Agent 分独立 git worktree 与分支，物理杜绝写冲突。需目标目录是 git 仓库。</div>
+            <span class="mode-card__tag">Omarchy 官方未做 · 但并发改同一仓库必须</span>
+          </div>
+          <div class="mode-viz">
+            <div class="mode-viz__pane" style="height:20px"></div>
+            <div class="mode-viz__pane" style="height:20px"></div>
+            <div class="mode-viz__pane" style="height:20px"></div>
+          </div>
+        </button>
+      </div>
+
+      <!-- 基本配置 -->
+      <div class="field">
+        <label class="field__label" for="selAgent">Agent CLI</label>
+        <select class="select" id="selAgent"></select>
+      </div>
+
+      <div class="field">
+        <div class="field__label">
+          <label for="rngCount">Agent 数量</label>
+          <span class="spacer"></span>
+          <span class="mono" id="countVal">4</span>
+        </div>
+        <input class="slider" type="range" id="rngCount" min="1" max="12" value="4">
+        <div class="field__hint" id="countHint"></div>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="inpRepo">工作目录</label>
+        <input class="input" type="text" id="inpRepo" placeholder="例如 /home/user/project 或 .">
+        <div class="field__hint">worktree 模式要求该目录是 git 仓库</div>
+      </div>
+
+      <div class="row row--between" style="margin-bottom:var(--s-4)">
+        <div>
+          <div class="field__label" style="margin-bottom:2px">输入广播</div>
+          <div class="field__hint">并行模式下把键盘输入同步到所有 pane</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="swBroadcast" checked>
+          <span class="switch__track"></span>
+        </label>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- 任务分配 -->
+      <div class="row row--between" style="margin-bottom:var(--s-3)">
+        <div class="field__label" style="margin:0">Requirement 分配</div>
+        <div class="row" style="gap:6px">
+          <button class="btn btn--text btn--sm" id="btnTpl">填充模板</button>
+          <button class="btn btn--text btn--sm" id="btnClear">清空</button>
+        </div>
+      </div>
+      <div class="task-list" id="taskList"></div>
+
+      <button class="btn btn--filled btn--block btn--launch" id="btnLaunch">
+        启动编排
+      </button>
+    </div>
+  </section>
+
+  <!-- ============================================ 右：实时监控 -->
+  <section class="panel panel--monitor">
+    <div class="panel__head">
+      <h2 class="panel__title">实时监控</h2>
+      <span class="spacer"></span>
+      <span class="panel__hint" id="monHint">未启动</span>
+    </div>
+    <div class="panel__body">
+      <div class="session-bar">
+        <select class="select" id="selSession" style="flex:1 1 auto"></select>
+        <button class="btn btn--tonal btn--sm" id="btnDiff">Diff</button>
+        <button class="btn btn--danger btn--sm" id="btnStop">停止</button>
+      </div>
+
+      <div id="paneHost">
+        <div class="empty">
+          <div class="empty__icon">▦</div>
+          <div class="empty__title">尚未启动编排</div>
+          <div class="empty__desc">在左侧配置模式、数量与 requirement，然后点「启动编排」。这里会实时显示每个 Agent 的终端输出。</div>
+        </div>
+      </div>
+
+      <div class="command-bar">
+        <input class="input" type="text" id="inpCmd" placeholder="向选中 pane 发送指令（留空 pane = 广播）">
+        <button class="btn btn--tonal btn--sm" id="btnSend">发送</button>
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px">
+        <select class="select" id="selTarget" style="width:130px"></select>
+        <span class="spacer"></span>
+        <label class="row" style="gap:6px">
+          <span class="t-xs faint">自动刷新</span>
+          <label class="switch">
+            <input type="checkbox" id="swAuto" checked>
+            <span class="switch__track"></span>
+          </label>
+        </label>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div class="snackbar-host" id="snackHost"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
