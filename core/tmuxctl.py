@@ -134,6 +134,19 @@ class Tmux:
                 })
         return panes
 
+    def pane_command(self, session: str, index: int) -> str:
+        """返回指定 pane 当前前台进程名，用于判断 agent CLI 是否已接管该 pane。"""
+        code, out, _ = self._run(
+            ["list-panes", "-t", f"{session}:0", "-F",
+             "#{pane_index}\t#{pane_current_command}"])
+        if code != 0:
+            return ""
+        for line in out.splitlines():
+            p = line.split("\t")
+            if len(p) >= 2 and p[0] == str(index):
+                return (p[1] or "").strip()
+        return ""
+
     def send_keys(self, target: str, text: str, enter: bool = True) -> None:
         """-l 表示按字面量发送，不做按键名解析，避免特殊字符被吃掉。"""
         self._run(["send-keys", "-t", target, "-l", text])

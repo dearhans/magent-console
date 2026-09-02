@@ -29,10 +29,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from . import agents as agents_mod
 from .agents import resolve_command
 from .tmuxctl import Tmux, TmuxError
 
 MODES = ("parallel", "heterogeneous")
+
+# pane 前台进程仍是这些名字时，说明 agent CLI 尚未接管该 pane
+_SHELL_NAMES = {"bash", "zsh", "sh", "dash", "fish", "ksh", "pwsh"}
+
+# 等 CLI 接管 pane 的最长时间（秒）；超时仍会注入，但会如实标注未就绪
+PANE_READY_TIMEOUT = 25.0
 
 
 @dataclass
@@ -77,6 +84,9 @@ class Orchestrator:
         repo = os.path.abspath(os.path.expanduser(cfg.repo))
         os.makedirs(repo, exist_ok=True) if not os.path.isdir(repo) else None
 
+        # 启动前先确认该 agent 依赖的服务已就绪（如 ollama serve），不通就自动拉起
+        service = self._prepare_service(cfg.agent)
+
         session = cfg.session or self._session_name(cfg)
         cmd = resolve_command(cfg.agent)
 
@@ -98,9 +108,14 @@ class Orchestrator:
         else:
             self.tmux.set_sync(session, False)
 
-        # 注入任务（等 agent CLI 启动，给一点缓冲）
-        time.sleep(1.2)
-        self._inject_tasks(session, cfg)
+        # 等 CLI 真正接管每个 pane，避免任务文本落进 bash 变成 command not found
+        ready = self._wait_panes_ready(session, cfg.count)
+        if not any(ready):
+            raise RuntimeError(
+                "没有任何 pane 成功启动 %s（%s）。常见原因：该命令不存在，"
+                "或依赖服务不可达导致 CLI 直接退出。可在设置里点「测试」确认。"
+                % (cfg.agent, cmd))
+        self._inject_tasks(session, cfg, ready)
 
         return {
             "session": session,
@@ -109,37 +124,88 @@ class Orchestrator:
             "count": cfg.count,
             "repo": repo,
             "sync": self.tmux.get_sync(session),
+            "service": service,
+            "ready": ready,
             "panes": [
                 {"index": i,
                  "cwd": repo,
                  "task": cfg.tasks[i] if i < len(cfg.tasks) else (cfg.tasks[0] if cfg.mode == "parallel" and cfg.tasks else ""),
-                 "role": cfg.roles[i] if i < len(cfg.roles) else ""}
+                 "role": cfg.roles[i] if i < len(cfg.roles) else "",
+                 "ready": ready[i] if i < len(ready) else False}
                 for i in range(cfg.count)
             ],
         }
+
+    # ------------------------------------------------------------ 依赖服务
+    def _prepare_service(self, agent_id: str) -> Dict:
+        """启动前确认 agent 依赖的服务可达，必要时自动后台拉起。"""
+        spec = agents_mod.AGENTS.get(agent_id)
+        if spec is None:
+            return {"required": False, "ok": True, "detail": "未注册该 agent，跳过服务检查"}
+        url = spec.service_url()
+        if not url:
+            return {"required": False, "ok": True, "detail": "该 agent 无依赖服务"}
+        ok, detail = agents_mod.ensure_service(spec, auto_start=True)
+        if not ok:
+            raise RuntimeError(f"{spec.name} 依赖的服务未就绪：{detail}")
+        return {"required": True, "ok": True, "detail": detail, "url": url}
+
+    # ------------------------------------------------------------ 就绪等待
+    def _wait_panes_ready(self, session: str, count: int,
+                          timeout: float = PANE_READY_TIMEOUT) -> List[bool]:
+        """等每个 pane 的前台进程从启动 shell 切成 agent CLI，返回每个 pane 是否就绪。
+
+        只按进程名判断，不做输出匹配，避免把 agent 的 banner 误当成就绪信号。
+        """
+        ready = [False] * count
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for i in range(count):
+                if ready[i]:
+                    continue
+                proc = self.tmux.pane_command(session, i)
+                if proc and proc.lower() not in _SHELL_NAMES:
+                    ready[i] = True
+            if all(ready):
+                break
+            time.sleep(0.5)
+        return ready
 
     def _session_name(self, cfg: LaunchConfig) -> str:
         base = os.path.basename(os.path.abspath(os.path.expanduser(cfg.repo))) or "work"
         base = re.sub(r"[^A-Za-z0-9_-]", "-", base)
         return f"magent-{cfg.mode[:4]}-{base}"[:40]
 
-    def _inject_tasks(self, session: str, cfg: LaunchConfig) -> None:
+    def _inject_tasks(self, session: str, cfg: LaunchConfig,
+                      ready: Optional[List[bool]] = None) -> None:
         if not cfg.tasks:
             return
+        live = ready if ready is not None else [True] * cfg.count
+
         if cfg.mode == "parallel":
-            # 同一份 requirement 广播：只需发给 pane 0，sync 已开则自动同步；
+            # 同一份 requirement 广播：sync 已开则只发给一个 pane，tmux 自动同步；
             # 未开 sync 时逐个发同样的内容
-            text = cfg.tasks[0]
+            text = cfg.tasks[0] if cfg.tasks else ""
+            if not text.strip():
+                return
             if self.tmux.get_sync(session):
-                self.tmux.send_keys(f"{session}:0.0", text)
+                src = next((i for i in range(cfg.count)
+                            if i < len(live) and live[i]), 0)
+                self.tmux.send_keys(f"{session}:0.{src}", text)
             else:
                 for i in range(cfg.count):
+                    if i < len(live) and not live[i]:
+                        continue
                     self.tmux.send_keys(f"{session}:0.{i}", text)
         else:
-            # 异质分工：第 i 个 pane 领第 i 份任务
+            # 异质分工：第 i 个 pane 领第 i 份任务，逐条定向注入
             for i, task in enumerate(cfg.tasks):
-                if i >= cfg.count or not task.strip():
+                if i >= cfg.count:
                     break
+                if not task.strip():
+                    continue
+                if i < len(live) and not live[i]:
+                    continue
                 self.tmux.send_keys(f"{session}:0.{i}", task)
 
     # ------------------------------------------------------------ 运行时

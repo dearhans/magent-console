@@ -528,7 +528,16 @@
         }),
       });
       state.current = d.session;
-      toast('已启动会话 ' + d.session + '（' + (d.panes || d.count || 0) + ' 个 pane）', 'ok');
+      const n = d.panes ? d.panes.length : (d.count || 0);
+      const notReady = (d.ready || []).map((r, i) => (r ? null : '#' + i))
+        .filter((x) => x !== null);
+      toast('已启动会话 ' + d.session + '（' + n + ' 个 pane）' +
+        (notReady.length ? '；pane ' + notReady.join('、') +
+          ' 未检测到 agent 进程，未注入任务' : ''),
+        notReady.length ? 'warn' : 'ok');
+      if (d.service && d.service.required && d.service.detail) {
+        toast(d.service.detail, 'ok');
+      }
       await loadSessions();
       await refreshStatus();
       startPolling();
@@ -754,6 +763,81 @@
         };
         line.appendChild(btnClear);
         row.appendChild(line);
+      }
+
+      // 本地模型 / 自建服务：可配置服务地址与模型名
+      if (a.api_url_env || a.local) {
+        const cfgRow = document.createElement('div');
+        cfgRow.className = 'row row--wrap';
+        cfgRow.style.cssText = 'gap:6px;align-items:center';
+
+        const urlInp = document.createElement('input');
+        urlInp.className = 'input';
+        urlInp.type = 'text';
+        urlInp.style.cssText = 'height:30px;font-size:12px;flex:2 1 200px';
+        urlInp.placeholder = '服务地址（' + (a.api_url_env || 'API_URL') +
+          '），如 http://127.0.0.1:11434';
+        urlInp.value = a.api_url || '';
+        cfgRow.appendChild(urlInp);
+
+        const modelInp = document.createElement('input');
+        modelInp.className = 'input';
+        modelInp.type = 'text';
+        modelInp.style.cssText = 'height:30px;font-size:12px;flex:1 1 130px';
+        modelInp.placeholder = '模型名，如 qwen3.5:4b';
+        modelInp.value = a.model || '';
+        cfgRow.appendChild(modelInp);
+
+        const btnSaveCfg = document.createElement('button');
+        btnSaveCfg.className = 'btn btn--filled btn--sm';
+        btnSaveCfg.type = 'button';
+        btnSaveCfg.textContent = '保存配置';
+        btnSaveCfg.onclick = async () => {
+          const url = urlInp.value.trim();
+          const model = modelInp.value.trim();
+          if (!url) { toast('请填写服务地址', 'err'); return; }
+          btnSaveCfg.disabled = true;
+          try {
+            await api('/api/config', {
+              method: 'POST',
+              body: JSON.stringify({
+                agent_overrides: { [a.id]: { api_url: url, model: model } },
+              }),
+            });
+            await loadConfig();
+            await loadAgents();
+            toast(a.name + ' 的服务地址与模型已保存');
+          } catch (e) {
+            toast('保存失败：' + e.message, 'err');
+          } finally { btnSaveCfg.disabled = false; }
+        };
+        cfgRow.appendChild(btnSaveCfg);
+
+        const btnReset = document.createElement('button');
+        btnReset.className = 'btn btn--text btn--sm';
+        btnReset.type = 'button';
+        btnReset.textContent = '恢复默认';
+        btnReset.onclick = async () => {
+          try {
+            await api('/api/config', {
+              method: 'POST',
+              body: JSON.stringify({ agent_overrides: { [a.id]: null } }),
+            });
+            await loadConfig();
+            await loadAgents();
+            toast(a.name + ' 已恢复内置默认配置');
+          } catch (e) { toast('恢复失败：' + e.message, 'err'); }
+        };
+        cfgRow.appendChild(btnReset);
+        row.appendChild(cfgRow);
+
+        if (a.service_start) {
+          const tip = document.createElement('div');
+          tip.className = 't-xs faint';
+          tip.textContent = '未探测到服务时会自动执行：' + a.service_start +
+            '（仅对 127.0.0.1 / localhost 生效）';
+          row.appendChild(tip);
+        }
       }
 
       if (!a.installed && a.install_hint) {
@@ -1041,8 +1125,22 @@
   }
 
   function openDrawer(open) {
-    $('drawerSettings').hidden = !open;
-    $('drawerMask').hidden = !open;
+    const drawer = $('drawerSettings');
+    const mask = $('drawerMask');
+    if (open) {
+      drawer.hidden = false;
+      mask.hidden = false;
+      void drawer.offsetWidth;           // 强制 reflow，保证过渡动画生效
+      drawer.classList.add('is-open');   // CSS 里 .is-open 才 translateX(0)
+      mask.classList.add('is-open');
+    } else {
+      drawer.classList.remove('is-open');
+      mask.classList.remove('is-open');
+      setTimeout(() => {                // 等过渡结束再隐藏，避免动画被截断
+        drawer.hidden = true;
+        mask.hidden = true;
+      }, 220);
+    }
   }
 
   // ============================================================ 启动

@@ -136,10 +136,13 @@ def load_credentials() -> Dict[str, Any]:
     data.setdefault("version", VERSION)
     data.setdefault("agent_auth", {})
     data.setdefault("custom_agents", [])
+    data.setdefault("agent_overrides", {})
     if not isinstance(data.get("agent_auth"), dict):
         data["agent_auth"] = {}
     if not isinstance(data.get("custom_agents"), list):
         data["custom_agents"] = []
+    if not isinstance(data.get("agent_overrides"), dict):
+        data["agent_overrides"] = {}
     return data
 
 
@@ -154,6 +157,20 @@ def get_agent_auth() -> Dict[str, str]:
 
 def get_custom_agents() -> List[Dict[str, Any]]:
     return list(load_credentials().get("custom_agents", []))
+
+
+def get_agent_overrides() -> Dict[str, Dict[str, Any]]:
+    """内置 agent 的用户覆盖配置：{agent_id: {api_url, model, args}}。
+
+    用于给 ollama 等本地模型填服务地址与模型名，也可覆盖任意内置 agent 的参数。
+    """
+    raw = load_credentials().get("agent_overrides", {})
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                out[str(k)] = v
+    return out
 
 
 # ---------------------------------------------------------------- 角色库
@@ -264,6 +281,10 @@ def _spec_from_dict(d: Dict[str, Any]) -> Optional[AgentSpec]:
         doc_url=str(d.get("doc_url") or ""),
         model=str(d.get("model") or ""),
         probe_url=str(d.get("probe_url") or ""),
+        api_url=str(d.get("api_url") or "").strip(),
+        api_url_env=(str(d["api_url_env"]).strip() if d.get("api_url_env") else None),
+        probe_path=str(d.get("probe_path") or ""),
+        service_start=str(d.get("service_start") or ""),
         custom=True,
     )
 
@@ -271,8 +292,10 @@ def _spec_from_dict(d: Dict[str, Any]) -> Optional[AgentSpec]:
 def sync_registry() -> List[str]:
     """把自定义 agent 同步进 core.agents 注册表，返回自定义 agent 的 id 列表。
 
-    与内置 id 冲突时自动加 -custom 后缀，不覆盖内置定义。
+    先把用户在设置里填的覆盖（服务地址 / 模型名）应用到内置 agent，
+    再注册自定义 agent。与内置 id 冲突时自动加 -custom 后缀，不覆盖内置定义。
     """
+    agents_mod.apply_overrides(get_agent_overrides())
     custom = get_custom_agents()
     specs: List[AgentSpec] = []
     seen = set()
@@ -288,13 +311,14 @@ def sync_registry() -> List[str]:
         seen.add(spec.id)
         specs.append(spec)
     agents_mod.reset_custom()
-    agents_mod.register_custom(specs)
+    for spec in specs:
+        agents_mod.register_custom(spec)
     return [s.id for s in specs]
 
 
 def iter_agent_specs() -> List[AgentSpec]:
-    """内置 + 自定义，按注册表顺序。"""
-    return list(agents_mod.AGENTS.values())
+    """内置 + 自定义，按注册表顺序（自定义同名项覆盖内置）。"""
+    return list(agents_mod.registered_agents().values())
 
 
 # ---------------------------------------------------------------- 组装视图
@@ -307,6 +331,10 @@ def agent_view(spec: AgentSpec, stored: Optional[str]) -> Dict[str, Any]:
         "model": spec.model,
         "args": list(spec.default_args),
         "probe_url": spec.probe_url,
+        "api_url": spec.api_url,
+        "api_url_env": spec.api_url_env,
+        "service_start": spec.service_start,
+        "service_url": spec.service_url(),
         "auth_source": source,
         "auth_value_masked": mask(value) if source == "file" else
                              (mask(value) if source == "env" else ""),
@@ -365,6 +393,32 @@ def save_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             auth[str(k)] = s
     creds["agent_auth"] = auth
 
+    # 内置 agent 的覆盖配置（服务地址 / 模型名），传空值即恢复内置默认
+    incoming_ov = payload.get("agent_overrides")
+    if isinstance(incoming_ov, dict):
+        ov = dict(creds.get("agent_overrides", {}) or {})
+        for k, v in incoming_ov.items():
+            aid = str(k)
+            if v is None:
+                ov.pop(aid, None)
+                continue
+            if not isinstance(v, dict):
+                continue
+            cur = dict(ov.get(aid, {}) or {})
+            for f in ("api_url", "model", "args"):
+                if f not in v:
+                    continue
+                val = v[f]
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    cur.pop(f, None)          # 清空 = 恢复内置默认
+                else:
+                    cur[f] = val
+            if cur:
+                ov[aid] = cur
+            else:
+                ov.pop(aid, None)
+        creds["agent_overrides"] = ov
+
     if isinstance(payload.get("custom_agents"), list):
         cleaned: List[Dict[str, Any]] = []
         for d in payload["custom_agents"]:
@@ -383,6 +437,10 @@ def save_config(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "install_hint": spec.install_hint,
                 "doc_url": spec.doc_url,
                 "probe_url": spec.probe_url,
+                "api_url": spec.api_url,
+                "api_url_env": spec.api_url_env,
+                "probe_path": spec.probe_path,
+                "service_start": spec.service_start,
             })
         creds["custom_agents"] = cleaned
 
@@ -480,7 +538,7 @@ def test_agent(agent_id: str, spec_override: Optional[Dict[str, Any]] = None,
     }
 
     network: Dict[str, Any] = {"checked": False, "ok": None, "status": None, "detail": ""}
-    endpoint = spec.probe_url or (PROBE_ENDPOINTS.get(spec.id, {}) or {}).get("url", "")
+    endpoint = spec.service_url() or (PROBE_ENDPOINTS.get(spec.id, {}) or {}).get("url", "")
     mode = "bearer" if spec.probe_url else (PROBE_ENDPOINTS.get(spec.id, {}) or {}).get("mode", "none")
     if do_network and endpoint and (value or mode == "none"):
         network = _http_probe(endpoint, mode, value)
@@ -501,7 +559,13 @@ def test_agent(agent_id: str, spec_override: Optional[Dict[str, Any]] = None,
                "或填 env:变量名 引用环境变量" % spec.auth_env)
     elif network.get("checked") and network.get("ok") is False:
         ok = False
-        msg = "已安装且已配置鉴权，但接口返回 %s —— 请检查密钥是否有效、是否有该模型的访问权限" % network.get("detail")
+        if spec.local and spec.service_start:
+            msg = ("本地服务未就绪：%s。请启动服务（%s）后重试；"
+                   "若服务跑在宿主机/另一台机器上，请在设置里把服务地址改成实际可达的地址"
+                   % (network.get("detail"), spec.service_start))
+        else:
+            msg = ("已安装且已配置鉴权，但接口返回 %s —— 请检查密钥是否有效、"
+                   "是否有该模型的访问权限" % network.get("detail"))
     elif network.get("ok"):
         ok = True
         msg = "可用：已安装（%s），鉴权连通性探测通过（%s）" % (
