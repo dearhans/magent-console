@@ -40,6 +40,8 @@ class AgentSpec:
     api_url_env: str = ""           # 注入服务地址所用的环境变量，例 OLLAMA_HOST
     probe_path: str = ""            # 健康检查路径，与 api_url 拼接，例 /api/tags
     service_start: str = ""         # 服务未起时的后台启动命令，例 ollama serve
+    ready_pattern: str = ""         # pane 输出匹配到此正则才算真正可交互（REPL 就绪），
+                                    # 留空则仅按进程名判断，例 ollama 的 ">>>"
 
     def resolved_cmd(self) -> str:
         args = " ".join(self.default_args)
@@ -101,6 +103,7 @@ AGENTS: Dict[str, AgentSpec] = {
         model="qwen3.5:4b",
         api_url="http://127.0.0.1:11434", api_url_env="OLLAMA_HOST",
         probe_path="/api/tags", service_start="ollama serve",
+        ready_pattern=r">>>",
         install_shell="curl -fsSL https://ollama.com/install.sh | sh",
         install_hint="本地模型无需 API key，但吃 CPU/GPU/内存；无独显时速度很慢，"
                      "且 ollama run 是交互式 REPL，不适合作为 agent 编排目标，"
@@ -166,6 +169,7 @@ def detect(spec: AgentSpec, key: Optional[str] = None) -> Dict:
         "api_url": spec.api_url,
         "api_url_env": spec.api_url_env,
         "service_start": spec.service_start,
+        "ready_pattern": spec.ready_pattern,
         "service_url": spec.service_url(),
     }
 

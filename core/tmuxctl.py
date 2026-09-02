@@ -173,5 +173,15 @@ class Tmux:
             self.kill_session(name)
         self.new_session(name, cwd, command)
 
+    def set_env(self, session: str, key: str, value: str) -> None:
+        self._run(["set-environment", "-t", session, key, value])
+
+    def get_env(self, session: str, key: str) -> str:
+        code, out, _ = self._run(["show-environment", "-t", session, key])
+        if code != 0 or not (out or "").strip():
+            return ""
+        line = out.strip().splitlines()[0]
+        return line.split("=", 1)[1].strip() if "=" in line else ""
+
     def pane_target(self, session: str, index: int) -> str:
         return f"{session}:0.{index}"

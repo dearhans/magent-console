@@ -460,11 +460,17 @@
     }
 
     panes.forEach((p, i) => {
+      const loading = p.repl_ready === false;   // 本地模型 REPL 还没出提示符
       const br = $('br-' + i);
-      if (br) br.textContent = p.branch || p.role || (p.alive ? 'alive' : 'dead');
+      if (br) {
+        br.textContent = loading ? '模型加载中…'
+          : (p.branch || p.role || (p.alive ? 'alive' : 'dead'));
+        br.style.color = loading ? 'var(--c-warn)' : '';
+      }
       const dot = $('dot-' + i);
       if (dot) {
-        dot.style.color = p.alive ? 'var(--c-success)' : 'var(--c-text-faint)';
+        dot.style.color = loading ? 'var(--c-warn)'
+          : (p.alive ? 'var(--c-success)' : 'var(--c-text-faint)');
         dot.className = 'dot' + (p.alive ? ' dot--pulse' : '');
       }
       const out = $('out-' + i);
@@ -477,8 +483,24 @@
     });
 
     const alive = panes.filter((p) => p.alive).length;
-    $('monHint').textContent = panes.length + ' pane · ' + alive + ' 存活 · ' +
+    const tracked = panes.filter((p) => typeof p.repl_ready === 'boolean');
+    const replN = tracked.filter((p) => p.repl_ready).length;
+    $('monHint').textContent = panes.length + ' pane · ' + alive + ' 存活' +
+      (tracked.length ? ' · ' + replN + '/' + tracked.length + ' 就绪' : '') + ' · ' +
       new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    updateSendGate(panes);
+  }
+
+  // 本地模型 REPL 未就绪时锁住发送区：此时发下去的指令会被 REPL 吞掉
+  function updateSendGate(panes) {
+    const blocked = panes.some((p) => p.repl_ready === false);
+    const hint = $('sendHint'), btn = $('btnSend'), inp = $('inpCmd');
+    if (hint) {
+      hint.textContent = blocked ? '模型加载中，暂勿广播（就绪后自动下发 requirement）' : '';
+      hint.style.display = blocked ? '' : 'none';
+    }
+    if (btn) btn.disabled = blocked;
+    if (inp) inp.disabled = blocked;
   }
 
   function renderTargets(n) {
@@ -535,6 +557,10 @@
         (notReady.length ? '；pane ' + notReady.join('、') +
           ' 未检测到 agent 进程，未注入任务' : ''),
         notReady.length ? 'warn' : 'ok');
+      if (d.pending_inject) {
+        toast('模型加载中：requirement 已挂起，pane 出现 ' +
+          (d.ready_pattern || '提示符') + ' 后会自动注入', 'warn');
+      }
       if (d.service && d.service.required && d.service.detail) {
         toast(d.service.detail, 'ok');
       }
@@ -553,6 +579,10 @@
     const text = $('inpCmd').value.trim();
     if (!text) return;
     if (!state.current) { toast('没有活动会话', 'warn'); return; }
+    if ($('btnSend') && $('btnSend').disabled) {
+      toast('模型加载中，暂勿广播', 'warn');
+      return;
+    }
     const target = $('selTarget').value;
     try {
       await api('/api/send', {

@@ -258,6 +258,15 @@ def apply_auth_env() -> Dict[str, str]:
     return applied
 
 
+def _default_ready_pattern(cmd: str) -> str:
+    """自定义 agent 未显式指定时，按命令推断 REPL 就绪标志。
+
+    ollama run 这类交互式 REPL 只有出现提示符后才吃得下输入，
+    模型加载完成前注入的指令会被直接吞掉。
+    """
+    return r">>>" if "ollama" in cmd.lower() else ""
+
+
 # ---------------------------------------------------------------- 自定义 agent 注册表
 def _spec_from_dict(d: Dict[str, Any]) -> Optional[AgentSpec]:
     if not isinstance(d, dict):
@@ -285,6 +294,7 @@ def _spec_from_dict(d: Dict[str, Any]) -> Optional[AgentSpec]:
         api_url_env=(str(d["api_url_env"]).strip() if d.get("api_url_env") else None),
         probe_path=str(d.get("probe_path") or ""),
         service_start=str(d.get("service_start") or ""),
+        ready_pattern=str(d.get("ready_pattern") or _default_ready_pattern(cmd)),
         custom=True,
     )
 
@@ -334,6 +344,7 @@ def agent_view(spec: AgentSpec, stored: Optional[str]) -> Dict[str, Any]:
         "api_url": spec.api_url,
         "api_url_env": spec.api_url_env,
         "service_start": spec.service_start,
+        "ready_pattern": spec.ready_pattern,
         "service_url": spec.service_url(),
         "auth_source": source,
         "auth_value_masked": mask(value) if source == "file" else
@@ -441,6 +452,7 @@ def save_config(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "api_url_env": spec.api_url_env,
                 "probe_path": spec.probe_path,
                 "service_start": spec.service_start,
+        "ready_pattern": spec.ready_pattern,
             })
         creds["custom_agents"] = cleaned
 

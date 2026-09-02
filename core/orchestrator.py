@@ -25,9 +25,10 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import agents as agents_mod
 from .agents import resolve_command
@@ -40,6 +41,13 @@ _SHELL_NAMES = {"bash", "zsh", "sh", "dash", "fish", "ksh", "pwsh"}
 
 # 等 CLI 接管 pane 的最长时间（秒）；超时仍会注入，但会如实标注未就绪
 PANE_READY_TIMEOUT = 25.0
+
+# 等本地模型 REPL 出现提示符（如 ollama 的 >>>）的最长时间。
+# 模型首次加载可能要几十秒到几分钟，这段时间注入的指令会被 REPL 吞掉。
+REPL_READY_TIMEOUT = 300.0
+
+# 会话所用的 agent 记在 tmux 环境变量里，服务重启后仍能查到
+SESSION_AGENT_ENV = "MAGENT_AGENT"
 
 
 @dataclass
@@ -77,6 +85,11 @@ class PaneState:
 class Orchestrator:
     def __init__(self, tmux: Optional[Tmux] = None):
         self.tmux = tmux or Tmux()
+        # 会话级状态：会话 -> agent id；已就绪的 (session,index)；已播报过就绪的会话
+        self._session_agent: Dict[str, str] = {}
+        self._ready_patterns: Dict[str, str] = {}
+        self._ready_announced: set = set()
+        self._injectors: Dict[str, Any] = {}      # 会话 -> 延迟注入线程
 
     # ------------------------------------------------------------ 启动
     def launch(self, cfg: LaunchConfig) -> Dict:
@@ -115,7 +128,22 @@ class Orchestrator:
                 "没有任何 pane 成功启动 %s（%s）。常见原因：该命令不存在，"
                 "或依赖服务不可达导致 CLI 直接退出。可在设置里点「测试」确认。"
                 % (cfg.agent, cmd))
-        self._inject_tasks(session, cfg, ready)
+        # 记住会话用的 agent，供后续 status / send 判断 REPL 就绪状态
+        self._session_agent[session] = cfg.agent
+        try:
+            self.tmux.set_env(session, SESSION_AGENT_ENV, cfg.agent)
+        except Exception:                                # noqa: BLE001
+            pass
+
+        # 交互式 REPL（如 ollama run）要等模型加载完出现提示符才吃得下输入，
+        # 未就绪就注入会被吞掉，因此交给后台线程盯着，一就绪就自动注入。
+        pattern = self._ready_pattern_of(cfg.agent)
+        repl_ready = [self._repl_ready(session, i, pattern) for i in range(cfg.count)]
+        deferred = bool(pattern) and bool(cfg.tasks) and not all(repl_ready)
+        if deferred:
+            self._start_deferred_inject(session, cfg, pattern)
+        else:
+            self._inject_tasks(session, cfg, ready)
 
         return {
             "session": session,
@@ -126,12 +154,16 @@ class Orchestrator:
             "sync": self.tmux.get_sync(session),
             "service": service,
             "ready": ready,
+            "repl_ready": repl_ready,
+            "ready_pattern": pattern,
+            "pending_inject": deferred,
             "panes": [
                 {"index": i,
                  "cwd": repo,
                  "task": cfg.tasks[i] if i < len(cfg.tasks) else (cfg.tasks[0] if cfg.mode == "parallel" and cfg.tasks else ""),
                  "role": cfg.roles[i] if i < len(cfg.roles) else "",
-                 "ready": ready[i] if i < len(ready) else False}
+                 "ready": ready[i] if i < len(ready) else False,
+                 "repl_ready": repl_ready[i] if i < len(repl_ready) else True}
                 for i in range(cfg.count)
             ],
         }
@@ -171,6 +203,59 @@ class Orchestrator:
             time.sleep(0.5)
         return ready
 
+    # ------------------------------------------------------------ REPL 就绪
+    @staticmethod
+    def _ready_pattern_of(agent_id: str) -> str:
+        """取该 agent 的 REPL 就绪标志（正则）；空串表示无需等待提示符。"""
+        spec = agents_mod.get(agent_id)          # 内置 + 自定义合并视图
+        return getattr(spec, "ready_pattern", "") or ""
+
+    def _repl_ready(self, session: str, index: int, pattern: str) -> bool:
+        """pane 输出里是否已出现 REPL 提示符。无 pattern 一律视为就绪。"""
+        if not pattern:
+            return True
+        try:
+            out = self.tmux.capture(f"{session}:0.{index}", 40)
+        except Exception:                                # noqa: BLE001
+            return False
+        try:
+            return re.search(pattern, out) is not None
+        except re.error:
+            return pattern in out
+
+    def _start_deferred_inject(self, session: str, cfg: LaunchConfig,
+                               pattern: str) -> None:
+        t = threading.Thread(target=self._deferred_inject,
+                             args=(session, cfg, pattern), daemon=True)
+        self._injectors[session] = t
+        t.start()
+
+    def _deferred_inject(self, session: str, cfg: LaunchConfig,
+                         pattern: str) -> None:
+        """后台盯住每个 pane，模型加载完（出现提示符）就自动注入各自的任务。"""
+        deadline = time.time() + REPL_READY_TIMEOUT
+        if cfg.mode == "parallel":
+            pending = list(range(cfg.count))
+        else:
+            pending = [i for i in range(min(cfg.count, len(cfg.tasks)))
+                       if cfg.tasks[i].strip()]
+
+        while pending and time.time() < deadline:
+            if not self.tmux.session_exists(session):
+                return
+            if cfg.mode == "parallel" and self.tmux.get_sync(session):
+                # sync 已开：只需等任意一个 pane 就绪，tmux 自动把输入同步给全体
+                for i in list(pending):
+                    if self._repl_ready(session, i, pattern):
+                        self._inject_one(session, cfg, i)
+                        return
+            else:
+                for i in list(pending):
+                    if self._repl_ready(session, i, pattern):
+                        self._inject_one(session, cfg, i)
+                        pending.remove(i)
+            time.sleep(1.0)
+
     def _session_name(self, cfg: LaunchConfig) -> str:
         base = os.path.basename(os.path.abspath(os.path.expanduser(cfg.repo))) or "work"
         base = re.sub(r"[^A-Za-z0-9_-]", "-", base)
@@ -196,7 +281,7 @@ class Orchestrator:
                 for i in range(cfg.count):
                     if i < len(live) and not live[i]:
                         continue
-                    self.tmux.send_keys(f"{session}:0.{i}", text)
+                    self._inject_one(session, cfg, i)
         else:
             # 异质分工：第 i 个 pane 领第 i 份任务，逐条定向注入
             for i, task in enumerate(cfg.tasks):
@@ -206,12 +291,26 @@ class Orchestrator:
                     continue
                 if i < len(live) and not live[i]:
                     continue
-                self.tmux.send_keys(f"{session}:0.{i}", task)
+                self._inject_one(session, cfg, i)
+
+    def _inject_one(self, session: str, cfg: LaunchConfig, index: int) -> None:
+        """给单个 pane 注入它该做的那条任务（并行模式一律发第 1 条）。"""
+        if cfg.mode == "parallel":
+            text = cfg.tasks[0] if cfg.tasks else ""
+        else:
+            text = cfg.tasks[index] if index < len(cfg.tasks) else ""
+        if not text.strip():
+            return
+        self.tmux.send_keys(f"{session}:0.{index}", text)
 
     # ------------------------------------------------------------ 运行时
     def status(self, session: str, lines: int = 40) -> Dict:
         if not self.tmux.session_exists(session):
             raise TmuxError(f"会话 {session} 不存在")
+
+        agent_id = (self._session_agent.get(session)
+                    or self.tmux.get_env(session, SESSION_AGENT_ENV))
+        pattern = self._ready_pattern_of(agent_id) if agent_id else ""
 
         panes: List[PaneState] = []
         for p in self.tmux.list_panes(session):
@@ -225,12 +324,22 @@ class Orchestrator:
             st.alive = not p["dead"] and self._pid_alive(p["pid"])
             panes.append(st)
 
+        def _repl_of(s: PaneState) -> bool:
+            if not pattern:
+                return True
+            try:
+                return re.search(pattern, s.output) is not None
+            except re.error:
+                return pattern in s.output
+
         return {
             "session": session,
             "sync": self.tmux.get_sync(session),
+            "agent": agent_id,
+            "ready_pattern": pattern,
             "panes": [
                 {"index": s.index, "pid": s.pid, "cwd": s.cwd, "dead": s.dead,
-                 "alive": s.alive, "branch": s.branch,
+                 "alive": s.alive, "branch": s.branch, "repl_ready": _repl_of(s),
                  "output": s.output, "bytes": len(s.output)}
                 for s in panes
             ],
@@ -238,6 +347,7 @@ class Orchestrator:
         }
 
     def send(self, session: str, text: str, pane: Optional[int] = None) -> Dict:
+        self._assert_repl_ready(session, pane)
         if pane is None:
             # 广播：优先用 tmux 自带的 sync 机制
             was_sync = self.tmux.get_sync(session)
@@ -251,6 +361,20 @@ class Orchestrator:
 
         self.tmux.send_keys(f"{session}:0.{pane}", text)
         return {"sent": "pane", "pane": pane}
+
+    def _assert_repl_ready(self, session: str, pane: Optional[int]) -> None:
+        """本地模型 REPL 未就绪时拒绝下发，避免指令被 REPL 吞掉。"""
+        agent_id = (self._session_agent.get(session)
+                    or self.tmux.get_env(session, SESSION_AGENT_ENV))
+        pattern = self._ready_pattern_of(agent_id) if agent_id else ""
+        if not pattern:
+            return
+        idx = 0 if pane is None else int(pane)   # 广播以 pane 0 为源
+        if self._repl_ready(session, idx, pattern):
+            return
+        raise ValueError(
+            "模型加载中（pane #%d 尚未出现 %s 提示符），现在发的指令会被吞掉，请稍候"
+            % (idx, pattern))
 
     def stop(self, session: str) -> Dict:
         self.tmux.kill_session(session)
